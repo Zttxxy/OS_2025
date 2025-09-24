@@ -1,58 +1,51 @@
 #include "kernel/types.h"
-#include "kernel/stat.h"
 #include "user/user.h"
 
-int main() {
-    int f2c[2];  // 父进程到子进程的管道
-    int c2f[2];  // 子进程到父进程的管道
-    char buf[1];
-    int pid;
-    int parent_pid = getpid();  // 保存父进程ID
+int main(int argc, char *argv[]) {
+    int f2c[2];  // parent to child
+    int c2f[2];  // child to parent
     
-    // 创建两个管道
     if (pipe(f2c) < 0 || pipe(c2f) < 0) {
-        fprintf(2, "pipe creation failed\n");
+        fprintf(2, "pipe failed\n");
         exit(1);
     }
     
-    pid = fork();
+    int pid = fork();
     if (pid < 0) {
         fprintf(2, "fork failed\n");
         exit(1);
-    } else if (pid == 0) {
-        // 子进程
-        close(f2c[1]);  // 关闭父到子管道的写端
-        close(c2f[0]);  // 关闭子到父管道的读端
+    }
+    
+    if (pid == 0) {  // child process
+        close(f2c[1]);  // close write end of parent-to-child
+        close(c2f[0]);  // close read end of child-to-parent
         
-        // 从父进程读取数据
-        read(f2c[0], buf, 1);
-        close(f2c[0]);  // 关闭父到子管道的读端
+        int parent_pid;
+        read(f2c[0], &parent_pid, sizeof(parent_pid));
+        close(f2c[0]);
         
-        // 父进程ID通过管道发送，或者使用其他方式传递
-        printf("%d: received ping\n", getpid());
+        printf("%d: received ping from pid %d\n", getpid(), parent_pid);
         
-        // 向父进程发送响应
-        write(c2f[1], buf, 1);
-        close(c2f[1]);  // 关闭子到父管道的写端
+        int child_pid = getpid();
+        write(c2f[1], &child_pid, sizeof(child_pid));
+        close(c2f[1]);
         
         exit(0);
-    } else {
-        // 父进程
-        close(f2c[0]);  // 关闭父到子管道的读端
-        close(c2f[1]);  // 关闭子到父管道的写端
+    } else {  // parent process
+        close(f2c[0]);  // close read end of parent-to-child
+        close(c2f[1]);  // close write end of child-to-parent
         
-        // 向子进程发送数据
-        buf[0] = 'X';  // 任意字节数据
-        write(f2c[1], buf, 1);
-        close(f2c[1]);  // 关闭父到子管道的写端
+        int parent_pid = getpid();
+        write(f2c[1], &parent_pid, sizeof(parent_pid));
+        close(f2c[1]);
         
-        // 从子进程读取响应
-        read(c2f[0], buf, 1);
-        close(c2f[0]);  // 关闭子到父管道的读端
+        int child_pid;
+        read(c2f[0], &child_pid, sizeof(child_pid));
+        close(c2f[0]);
         
-        printf("%d: received pong\n", getpid());
+        printf("%d: received pong from pid %d\n", getpid(), child_pid);
         
-        wait(0);  // 等待子进程结束
+        wait(0);
         exit(0);
     }
 }

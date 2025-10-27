@@ -1,6 +1,5 @@
-// Physical memory allocator, for user processes,
-// kernel stacks, page-table pages,
-// and pipe buffers. Allocates whole 4096-byte pages.
+// Physical memory allocator for xv6
+// Each CPU has its own freelist and lock to reduce contention.
 
 #include "types.h"
 #include "param.h"
@@ -9,40 +8,65 @@
 #include "riscv.h"
 #include "defs.h"
 
-void freerange(void *pa_start, void *pa_end);
-
-extern char end[]; // first address after kernel.
-                   // defined by kernel.ld.
+extern char end[]; // first address after kernel, defined by kernel.ld
 
 struct run {
   struct run *next;
 };
 
-struct {
+// Per-CPU memory allocator
+struct kmem {
   struct spinlock lock;
   struct run *freelist;
-} kmem;
+};
 
+struct kmem kmems[NCPU];       // One freelist per CPU
+static char kmem_names[NCPU][8]; // Persistent lock names
+
+// Helper: format lock name "kmem0", "kmem1", ...
+static void
+format_kmem_name(char *buf, int id)
+{
+  buf[0] = 'k'; buf[1] = 'm'; buf[2] = 'e'; buf[3] = 'm';
+  if (id < 10) {
+    buf[4] = '0' + id;
+    buf[5] = 0;
+  } else if (id < 100) {
+    buf[4] = '0' + (id / 10);
+    buf[5] = '0' + (id % 10);
+    buf[6] = 0;
+  } else {
+    buf[4] = 0;
+  }
+}
+
+// Forward declarations
+void freerange(void *pa_start, void *pa_end);
+void kfree(void *pa);
+void *kalloc(void);
+
+// Initialize memory allocator
 void
 kinit()
 {
-  initlock(&kmem.lock, "kmem");
+  for (int i = 0; i < NCPU; i++) {
+    format_kmem_name(kmem_names[i], i);
+    initlock(&kmems[i].lock, kmem_names[i]);
+    kmems[i].freelist = 0;
+  }
   freerange(end, (void*)PHYSTOP);
 }
 
+// Free a range of physical memory
 void
 freerange(void *pa_start, void *pa_end)
 {
-  char *p;
-  p = (char*)PGROUNDUP((uint64)pa_start);
-  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE)
+  char *p = (char*)PGROUNDUP((uint64)pa_start);
+  for (; p + PGSIZE <= (char*)pa_end; p += PGSIZE)
     kfree(p);
 }
 
-// Free the page of physical memory pointed at by v,
-// which normally should have been returned by a
-// call to kalloc().  (The exception is when
-// initializing the allocator; see kinit above.)
+// Free one 4KB page of physical memory
 void
 kfree(void *pa)
 {
@@ -51,32 +75,53 @@ kfree(void *pa)
   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
     panic("kfree");
 
-  // Fill with junk to catch dangling refs.
-  memset(pa, 1, PGSIZE);
-
+  memset(pa, 1, PGSIZE); // fill with junk
   r = (struct run*)pa;
 
-  acquire(&kmem.lock);
-  r->next = kmem.freelist;
-  kmem.freelist = r;
-  release(&kmem.lock);
+  push_off();             // disable interrupts
+  int id = cpuid();       // current CPU
+  pop_off();
+
+  acquire(&kmems[id].lock);
+  r->next = kmems[id].freelist;
+  kmems[id].freelist = r;
+  release(&kmems[id].lock);
 }
 
-// Allocate one 4096-byte page of physical memory.
-// Returns a pointer that the kernel can use.
-// Returns 0 if the memory cannot be allocated.
+// Allocate one 4KB page of physical memory
 void *
 kalloc(void)
 {
-  struct run *r;
+  struct run *r = 0;
 
-  acquire(&kmem.lock);
-  r = kmem.freelist;
-  if(r)
-    kmem.freelist = r->next;
-  release(&kmem.lock);
+  push_off();
+  int id = cpuid();
+  pop_off();
 
-  if(r)
+  // 1. Try current CPU freelist first
+  acquire(&kmems[id].lock);
+  r = kmems[id].freelist;
+  if (r)
+    kmems[id].freelist = r->next;
+  release(&kmems[id].lock);
+
+  // 2. If empty, try to steal from other CPUs
+  if (!r) {
+    for (int i = 0; i < NCPU; i++) {
+      if (i == id) continue;
+      acquire(&kmems[i].lock);
+      r = kmems[i].freelist;
+      if (r) {
+        kmems[i].freelist = r->next;
+        release(&kmems[i].lock);
+        break;
+      }
+      release(&kmems[i].lock);
+    }
+  }
+
+  if (r)
     memset((char*)r, 5, PGSIZE); // fill with junk
+
   return (void*)r;
 }

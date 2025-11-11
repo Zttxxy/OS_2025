@@ -15,6 +15,8 @@ r_mhartid()
 #define MSTATUS_MPP_U (0L << 11)
 #define MSTATUS_MIE (1L << 3)    // machine-mode interrupt enable.
 
+#define SSTATUS_SUM (1L << 18) 
+
 static inline uint64
 r_mstatus()
 {

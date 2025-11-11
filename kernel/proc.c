@@ -26,17 +26,18 @@ void procinit(void) {
   struct proc *p;
 
   initlock(&pid_lock, "nextpid");
-  for (p = proc; p < &proc[NPROC]; p++) {
+  for(p = proc; p < &proc[NPROC]; p++) {
     initlock(&p->lock, "proc");
 
-    // Allocate a page for the process's kernel stack.
-    // Map it high in memory, followed by an invalid
-    // guard page.
+    // 分配内核栈物理页
     char *pa = kalloc();
-    if (pa == 0) panic("kalloc");
+    if(pa == 0) panic("kalloc");
     uint64 va = KSTACK((int)(p - proc));
+    
+    // 在全局内核页表中建立映射
     kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
     p->kstack = va;
+    p->kstack_pa = (uint64)pa;  // 保存物理地址
   }
   kvminithart();
 }
@@ -97,6 +98,21 @@ static struct proc *allocproc(void) {
 found:
   p->pid = allocpid();
 
+  //  任务2
+  // 创建独立内核页表
+  if((p->k_pagetable = proc_kpagetable()) == 0) {
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
+  // 在独立内核页表中映射内核栈
+  if(mappages(p->k_pagetable, p->kstack, PGSIZE, p->kstack_pa, PTE_R | PTE_W) < 0) {
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
   // Allocate a trapframe page.
   if ((p->trapframe = (struct trapframe *)kalloc()) == 0) {
     release(&p->lock);
@@ -124,6 +140,12 @@ found:
 // including user pages.
 // p->lock must be held.
 static void freeproc(struct proc *p) {
+  // 任务2
+  if(p->k_pagetable)
+    proc_freekpagetable(p->k_pagetable);
+  p->k_pagetable = 0;
+
+
   if (p->trapframe) kfree((void *)p->trapframe);
   p->trapframe = 0;
   if (p->pagetable) proc_freepagetable(p->pagetable, p->sz);
@@ -187,6 +209,7 @@ void userinit(void) {
 
   p = allocproc();
   initproc = p;
+  printf("DEBUG: userinit - allocated proc with pid=%d\n", p->pid);
 
   // allocate one user page and copy init's instructions
   // and data into it.
@@ -425,6 +448,12 @@ void scheduler(void) {
     for (p = proc; p < &proc[NPROC]; p++) {
       acquire(&p->lock);
       if (p->state == RUNNABLE) {
+        // 任务2
+        // 切换到进程独立内核页表
+         w_satp(MAKE_SATP(p->k_pagetable));
+         sfence_vma();
+
+        found = 1;
         // Switch to chosen process.  It is the process's job
         // to release its lock and then reacquire it
         // before jumping back to us.
@@ -432,13 +461,21 @@ void scheduler(void) {
         c->proc = p;
         swtch(&c->context, &p->context);
 
+        // 切换回全局内核页表
+        kvminithart();
+
         // Process is done running for now.
         // It should have changed its p->state before coming back.
         c->proc = 0;
 
-        found = 1;
       }
       release(&p->lock);
+    }
+    if(found == 0) {
+      // 确保使用全局内核页表
+      kvminithart();
+      intr_on();
+      asm volatile("wfi");
     }
 #if !defined(LAB_FS)
     if (found == 0) {
